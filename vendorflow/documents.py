@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from pathlib import Path
 from typing import Any
 
+from .storage import get_setting
 
-MAX_UPLOAD_BYTES = int(os.getenv("VENDORFLOW_MAX_UPLOAD_MB", "10")) * 1024 * 1024
+
+MAX_UPLOAD_BYTES = int(get_setting("VENDORFLOW_MAX_UPLOAD_MB", "10")) * 1024 * 1024
 ALLOWED_MIME_TYPES = {"application/pdf", "application/x-pdf", ""}
 
 
@@ -35,14 +36,15 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def extract_pdf_text(path: str | Path) -> tuple[str, str | None]:
+def extract_pdf_text(path: str | Path | bytes) -> tuple[str, str | None]:
     """Return extracted text and an optional processing limitation."""
     try:
         import pymupdf as fitz
     except ImportError:
         return "", "PyMuPDF is not installed; install the project dependencies to process PDFs."
     try:
-        with fitz.open(str(path)) as pdf:
+        document = fitz.open(stream=path, filetype="pdf") if isinstance(path, bytes) else fitz.open(str(path))
+        with document as pdf:
             text = "\n".join(page.get_text("text") for page in pdf).strip()
     except Exception as exc:
         return "", f"PDF could not be opened ({type(exc).__name__})."
@@ -75,7 +77,7 @@ def deterministic_extract(text: str) -> dict[str, str]:
     return {key: value for key, value in results.items() if value}
 
 
-def extract_document(path: str | Path, ai_enabled: bool = False) -> dict[str, Any]:
+def extract_document(path: str | Path | bytes, ai_enabled: bool = False) -> dict[str, Any]:
     text, limitation = extract_pdf_text(path)
     fields = deterministic_extract(text) if text else {}
     methods = {field: "local_pdf_text" for field in fields}

@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .streamlit_smoke.py
+.streamlit/secrets.toml
 *.py[cod]
 data/
 *.db

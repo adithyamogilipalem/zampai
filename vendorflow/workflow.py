@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +12,7 @@ from typing import Any, Callable
 
 from .db import DEFAULT_DB_PATH, database, initialize_database, json_dump, json_load, query_all, query_one
 from .documents import DocumentError, extract_document, sha256_bytes, validate_pdf_upload
+from .storage import document_key, get_setting, supabase_config, upload_document, uses_supabase_database, read_document
 from .validation import compare_documents, determine_risk_and_decision, normalized_identifier, validate_form
 
 
@@ -59,17 +58,23 @@ def _upload_tuple(value: Any) -> tuple[str, bytes, str]:
     raise DocumentError("Each upload must include a filename and PDF bytes.")
 
 
-def _write_doc(doc_root: Path, application_id: str, revision_no: int, doc_type: str, upload: Any) -> dict[str, Any]:
+def _write_doc(doc_root: Path, application_id: str, revision_no: int, doc_type: str, upload: Any, db_path: str | Path | None = None) -> dict[str, Any]:
     name, data, mime = _upload_tuple(upload)
     validate_pdf_upload(name, data, mime)
     doc_id = new_id("DOC")
-    folder = doc_root / application_id / f"revision_{revision_no}"
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{doc_id}.pdf"
-    path.write_bytes(data)
+    if uses_supabase_database(db_path, DEFAULT_DB_PATH):
+        config = supabase_config()
+        key = document_key(application_id, revision_no, doc_id)
+        stored_path = upload_document(config["bucket"], key, data, mime)
+    else:
+        folder = doc_root / application_id / f"revision_{revision_no}"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{doc_id}.pdf"
+        path.write_bytes(data)
+        stored_path = str(path.resolve())
     return {
         "document_id": doc_id, "document_type": doc_type, "original_name": Path(name).name,
-        "stored_path": str(path.resolve()), "mime_type": "application/pdf", "size_bytes": len(data), "sha256": sha256_bytes(data),
+        "stored_path": stored_path, "mime_type": "application/pdf", "size_bytes": len(data), "sha256": sha256_bytes(data),
     }
 
 
@@ -207,7 +212,7 @@ def _copy_previous_docs(db_path: str | Path, app_id: str, previous_revision: int
             "stored_path": row["stored_path"], "mime_type": row["mime_type"], "size_bytes": row["size_bytes"], "sha256": row["sha256"],
         })
     for doc_type, upload in replacements.items():
-        docs.append(_write_doc(doc_root, app_id, revision, doc_type, upload))
+        docs.append(_write_doc(doc_root, app_id, revision, doc_type, upload, db_path))
     return docs
 
 
@@ -269,7 +274,7 @@ def process_submission(
             prior_request = _recent_request(conn, request_signature)
             if prior_request:
                 return _duplicate_submission_result(conn, prior_request)
-            docs = [_write_doc(doc_root, application_id, revision_no, doc_type, upload) for doc_type, upload in uploads.items()]
+            docs = [_write_doc(doc_root, application_id, revision_no, doc_type, upload, db_path) for doc_type, upload in uploads.items()]
             conn.execute("INSERT INTO vendors(vendor_id,registered_name,trading_name,email,country,created_at) VALUES(?,?,?,?,?,?)", (vendor_id, snapshot["registered_name"], snapshot["trading_name"], snapshot["email"], snapshot["country"], now))
             conn.execute("INSERT INTO applications(application_id,vendor_id,status,risk_category,current_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", (application_id, vendor_id, "Processing", "Medium", 1, now, now))
             conn.execute("INSERT INTO application_revisions(application_id,revision_no,snapshot_json,submitted_at,submitted_by,change_summary) VALUES(?,?,?,?,?,?)", (application_id, 1, json_dump(snapshot), now, submitted_by, "Initial submission"))
@@ -292,7 +297,7 @@ def process_submission(
         _stage_start(db_path, run_id, application_id, STAGES[0], on_progress)
         extraction_findings = []
         for row in doc_records:
-            outcome = extract_document(row["stored_path"], ai_enabled=os.getenv("VENDORFLOW_ENABLE_AI", "false").lower() in {"1", "true", "yes"})
+            outcome = extract_document(read_document(row["stored_path"]), ai_enabled=str(get_setting("VENDORFLOW_ENABLE_AI", "false")).lower() in {"1", "true", "yes"})
             fields = outcome["fields"]
             extracted_by_type.setdefault(row["document_type"], {}).update(fields)
             if outcome["limitation"]:
@@ -342,7 +347,7 @@ def process_submission(
         safe_error = f"Workflow stopped safely ({type(exc).__name__}). Check the stored run and correct the submission before retrying."
         failed_at = utc_now()
         with database(db_path) as conn:
-            active_stage = conn.execute("SELECT stage_name FROM verification_checks WHERE run_id=? AND check_name='__stage__' AND status='Running' ORDER BY rowid LIMIT 1", (run_id,)).fetchone()
+            active_stage = conn.execute("SELECT stage_name FROM verification_checks WHERE run_id=? AND check_name='__stage__' AND status='Running' ORDER BY started_at LIMIT 1", (run_id,)).fetchone()
             if active_stage:
                 conn.execute("UPDATE verification_checks SET status='Failed',completed_at=?,error=?,findings_json=? WHERE run_id=? AND stage_name=? AND check_name='__stage__'", (failed_at, safe_error, json_dump({"error": safe_error}), run_id, active_stage["stage_name"]))
                 _audit(conn, application_id, "workflow_stage_failed", "system", {"stage": active_stage["stage_name"], "run_id": run_id, "error_type": type(exc).__name__})
@@ -408,7 +413,7 @@ def get_application(application_id: str, db_path: str | Path | None = None) -> d
     result["snapshot"] = json_load(query_one("SELECT snapshot_json FROM application_revisions WHERE application_id=? AND revision_no=?", (application_id.strip().upper(), app["current_revision"]), db_path)["snapshot_json"])
     result["documents"] = [dict(row) for row in query_all("SELECT * FROM uploaded_documents WHERE application_id=? AND revision_no=? ORDER BY created_at", (application_id.strip().upper(), app["current_revision"]), db_path)]
     result["extracted_fields"] = [dict(row) for row in query_all("SELECT e.*,d.document_type,d.original_name FROM extracted_fields e JOIN uploaded_documents d ON e.document_id=d.document_id WHERE e.run_id=?", (app["latest_run_id"],), db_path)] if app["latest_run_id"] else []
-    result["checks"] = [dict(row) | {"findings": json_load(row["findings_json"])} for row in query_all("SELECT * FROM verification_checks WHERE run_id=? ORDER BY rowid", (app["latest_run_id"],), db_path)] if app["latest_run_id"] else []
+    result["checks"] = [dict(row) | {"findings": json_load(row["findings_json"])} for row in query_all("SELECT * FROM verification_checks WHERE run_id=? ORDER BY CASE stage_name WHEN 'Document extraction' THEN 1 WHEN 'Form validation' THEN 2 WHEN 'Cross-document comparison' THEN 3 WHEN 'Duplicate search' THEN 4 WHEN 'Risk assessment' THEN 5 WHEN 'Decision and follow-up' THEN 6 ELSE 7 END, check_name", (app["latest_run_id"],), db_path)] if app["latest_run_id"] else []
     result["decisions"] = [dict(row) for row in query_all("SELECT * FROM decisions WHERE application_id=? ORDER BY created_at", (application_id.strip().upper(),), db_path)]
     result["revisions"] = [dict(row) | {"snapshot": json_load(row["snapshot_json"])} for row in query_all("SELECT * FROM application_revisions WHERE application_id=? ORDER BY revision_no", (application_id.strip().upper(),), db_path)]
     result["reviewer_actions"] = [dict(row) for row in query_all("SELECT * FROM reviewer_actions WHERE application_id=? ORDER BY created_at", (application_id.strip().upper(),), db_path)]

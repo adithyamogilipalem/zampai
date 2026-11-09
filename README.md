@@ -1,6 +1,6 @@
 # VendorFlow AI
 
-VendorFlow AI is a runnable Streamlit demonstration of intelligent vendor onboarding and verification. It collects vendor information and PDF evidence, extracts literal document text, applies transparent rules, searches prior applications for possible duplicates, generates a reasoned recommendation, and keeps revisions and decisions in SQLite.
+VendorFlow AI is a runnable Streamlit demonstration of intelligent vendor onboarding and verification. It collects vendor information and PDF evidence, extracts literal document text, applies transparent rules, searches prior applications for possible duplicates, generates a reasoned recommendation, and keeps revisions and decisions in SQLite locally or Supabase Postgres when hosted.
 
 ## Run locally
 
@@ -42,6 +42,8 @@ python -m vendorflow.seed --db data/vendorflow.db --uploads data/uploads
 ```text
 app.py                     Streamlit vendor and procurement experiences
 vendorflow/db.py           SQLite schema, connections and JSON helpers
+vendorflow/storage.py      Local/Supabase settings and private PDF Storage access
+vendorflow/migrate_supabase.py Read-only SQLite inventory and one-way Supabase migration
 vendorflow/documents.py    PDF validation, PyMuPDF text extraction, field patterns
 vendorflow/validation.py   Country policy, format rules, comparisons, risk and decisions
 vendorflow/workflow.py     Persistence, staged execution, duplicate search, audit, review
@@ -51,7 +53,7 @@ vendorflow/seed.py         Database initialization and seed CLI
 tests/test_workflow.py     Four required scenarios plus sensitive-data persistence check
 ```
 
-SQLite contains vendors, applications, revisions, uploaded document metadata, extracted fields with document/run sources, verification runs and checks, decisions, reviewer actions, communication drafts, and audit events. Revisions are append-only; an automated recommendation remains recorded after a reviewer acts. The live progress table is updated by callbacks from the actual synchronous workflow and reflects persisted stage statuses and timestamps.
+The database contains vendors, applications, revisions, uploaded document metadata, extracted fields with document/run sources, verification runs and checks, decisions, reviewer actions, communication drafts, and audit events. Local runs use SQLite and the local `data/` directory. Hosted runs use Postgres for records and a private Supabase Storage bucket for PDFs. Revisions are append-only; an automated recommendation remains recorded after a reviewer acts. The live progress table is updated by callbacks from the actual synchronous workflow and reflects persisted stage statuses and timestamps.
 
 ## Decision and verification design
 
@@ -80,16 +82,55 @@ Copy `.env.example` to `.env` and configure:
 
 PDF files over the configured size, non-PDF extensions/MIME types, empty uploads, and invalid PDF signatures are rejected before an application is created. Uploaded file names are basename-sanitized before storage and long digit sequences are masked in the interface.
 
-## Deployment and limitations
+## Free hosting: Streamlit Community Cloud + Supabase Free
 
-The app can run in a container or any host that supports Streamlit and writable persistent storage. `Dockerfile` and `docker-compose.yml` provide a local container launch with a mounted `data/` volume. For a hosted interviewer demo, use a persistent volume for both SQLite and uploaded files. Ephemeral serverless filesystems can lose records on restart, so they do not satisfy the persistence requirement. The demo login, local SQLite database, and upload storage are not production-grade security controls; do not put real vendor or bank data into this case study.
+This setup uses Streamlit Community Cloud for the Streamlit app and Supabase Free for durable Postgres records and private PDF objects. It does not need Render, a Render disk, Docker, or a paid hosting service. Community Cloud's local filesystem is not used for application records or uploaded PDFs when `VENDORFLOW_STORAGE_BACKEND = "supabase"` is configured. AI remains disabled unless explicitly enabled.
 
-### Render
+### 1. Create a free Supabase project
 
-The root `render.yaml` defines a Singapore Docker web service with a 1 GB persistent disk. The database and uploads are both stored beneath `/var/lib/vendorflow`, so submissions survive service restarts and deployments. The container uses Render's `PORT` environment variable. Because Render only supports persistent disks on paid web services, this configuration is not a free, always-on deployment.
+1. Create a Supabase account and choose the **Free** plan for the organization/project. Do not add paid compute, storage, or other upgrades for this walkthrough.
+2. In the project dashboard, copy the project URL and the server-side `service_role` key. Keep both private.
+3. Open **Connect** and select the **Session pooler** connection string. Use session mode on port `5432`; it works on IPv4-only hosting. Replace the password placeholder with the database password you chose. Percent-encode reserved characters in the password before inserting it in the URL.
+4. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and replace the placeholders. Keep `VENDORFLOW_STORAGE_BACKEND = "supabase"`. The real secrets file is ignored by Git. Set a demo admin password of your choice.
 
-Set `VENDORFLOW_ADMIN_PASSWORD` as a secret environment variable in Render before using Procurement Admin. The hosted app locks admin sign-in while this value is missing. Never commit the password or use real vendor information in this demonstration. AI extraction remains disabled unless explicitly configured.
+On first startup, VendorFlow creates the schema and a private PDF-only bucket named `vendor-documents` (or the bucket named in the secrets). It enables Postgres row-level security and revokes table grants from public/anonymous roles; no Data API policies are added. The app reads and writes through its server-side database connection. It uses the Storage service-role key only on the Streamlit server, never in the browser. The app stops with a setup message if Supabase is selected but a required credential is missing. Do not change the bucket to public.
+
+### 2. Optionally migrate the existing local database and PDFs
+
+Keep a backup of your local `data/vendorflow.db` and `data/uploads/`. The migration command itself opens the SQLite source read-only, checks every referenced document against its stored SHA-256 hash, and leaves the SQLite file and source PDFs in place. It copies to Supabase; it does not delete or move local data. Run migration **before the first Community Cloud launch** if you want only your existing records in the hosted database; an empty app otherwise seeds its fictional demo vendor.
+
+In PowerShell from the repository folder:
+
+```powershell
+python -m pip install -r requirements.txt
+Copy-Item .streamlit/secrets.toml.example .streamlit/secrets.toml
+# Edit .streamlit/secrets.toml with the private values from your Supabase project.
+python -m vendorflow.migrate_supabase --db data/vendorflow.db
+python -m vendorflow.migrate_supabase --db data/vendorflow.db --apply
+```
+
+The first command is a dry run. It reports counts and verifies the source PDFs without writing anything to Supabase. The second performs the copy. It is safe to retry: record IDs are preserved, inserts use conflict-ignore behavior, and document object paths are deterministic. If a target ID already exists, the migration leaves that target record untouched. Supabase may contain uploaded file objects if a database write is interrupted; re-running reuses the same paths. Review the row counts printed after migration. Do not paste secrets into chat or commit `.streamlit/secrets.toml`.
+
+If the project has no existing local applications, skip the migration; VendorFlow will seed one fictional Approved demo vendor on first launch.
+
+### 3. Deploy from GitHub to Streamlit Community Cloud
+
+1. Sign in to Streamlit Community Cloud with the GitHub account that can access `adithyamogilipalem/zampai`.
+2. Choose **Create app** → **Yup, I have an app**.
+3. Enter repository `adithyamogilipalem/zampai`, branch `master`, and main file path `app.py`.
+4. Open **Advanced settings**, choose Python `3.12`, and paste the populated contents of your local `.streamlit/secrets.toml` into **Secrets**. Do not paste the example placeholders.
+5. Deploy. Community Cloud will build the requirements and show the generated `*.streamlit.app` URL when the app is ready. Save that URL for your submission.
+
+Future commits pushed to `master` update the Community Cloud app. The root `render.yaml` is not used by this deployment path. The prior Render blueprint was left with auto-sync disabled; no paid Render deployment is part of these instructions.
+
+### Free-tier limits and demonstration scope
+
+Supabase Free currently includes a 500 MB database, 1 GB of file storage and 5 GB of egress; Free projects can pause after a week of low activity. The app enforces a smaller 10 MB PDF upload limit by default. Keep usage within the Free quotas and do not upgrade the project if you want to keep hosting free. Review current [Supabase Free plan limits](https://supabase.com/pricing) before deploying.
+
+Streamlit secrets are stored in the app's server-side settings and must never be committed. The Supabase bucket is private; its service-role key bypasses Storage RLS, so it must remain server-side. The admin login and vendor access flow are demonstration controls, not production-grade authentication. Use only fictional vendor records and documents. Demo Verification is simulated policy checking only; no live government, tax, identity, sanctions, or bank service is contacted. Supabase Free does not provide paid-plan backup assurances; keep your local database and documents as a backup.
+
+`Dockerfile`, `docker-compose.yml`, and `render.yaml` remain available for existing local/container work, but the free deployment walkthrough above does not use them.
 
 ## Quality checks
 
-The tests run all four required scenarios through `process_submission`, inspect their stored evidence and decisions, verify correction creates a second revision and run, and assert that raw bank account numbers do not appear in application snapshots. They use temporary SQLite databases and do not modify the live demo database.
+The tests run all four required scenarios through `process_submission`, inspect their stored evidence and decisions, verify correction creates a second revision and run, and assert that raw bank account numbers do not appear in application snapshots. They use temporary SQLite databases and do not modify the live demo database. Hosted Supabase connectivity cannot be tested until you create a project and configure your private secrets; the PostgreSQL and Storage paths are exercised by the app after that configuration.

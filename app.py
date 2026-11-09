@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hmac
-import os
 import re
 from pathlib import Path
 
@@ -20,6 +19,7 @@ from vendorflow.ai import ai_capability_label
 from vendorflow.db import DEFAULT_DB_PATH, initialize_database
 from vendorflow.demo import correct_missing_certificate, run_demo_scenario, seed_demo_data
 from vendorflow.documents import DocumentError
+from vendorflow.storage import StorageError, get_setting, uses_supabase_database
 from vendorflow.workflow import (
     STAGES,
     application_matches_vendor,
@@ -33,7 +33,7 @@ from vendorflow.workflow import (
 
 
 APP_ROOT = Path(__file__).resolve().parent
-DATA_ROOT = Path(os.getenv("VENDORFLOW_DATA_DIR", "data"))
+DATA_ROOT = Path(str(get_setting("VENDORFLOW_DATA_DIR", "data")))
 UPLOAD_ROOT = DATA_ROOT / "uploads"
 
 
@@ -87,7 +87,8 @@ st.markdown(
 def initialize_app() -> None:
     initialize_database(DEFAULT_DB_PATH)
     recover_interrupted_runs(DEFAULT_DB_PATH)
-    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    if not uses_supabase_database(DEFAULT_DB_PATH, DEFAULT_DB_PATH):
+        UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     try:
         seed_demo_data(DEFAULT_DB_PATH, UPLOAD_ROOT)
     except Exception as exc:
@@ -372,9 +373,9 @@ def admin_portal() -> None:
             username = st.text_input("Reviewer name", value="Procurement Reviewer")
             password = st.text_input("Demo admin password", type="password")
             submit = st.form_submit_button("Sign in", type="primary")
-        expected = os.getenv("VENDORFLOW_ADMIN_PASSWORD")
-        if not expected and os.getenv("RENDER"):
-            st.error("Admin access is locked until VENDORFLOW_ADMIN_PASSWORD is set in the hosting environment.")
+        expected = get_setting("VENDORFLOW_ADMIN_PASSWORD")
+        if not expected and uses_supabase_database(DEFAULT_DB_PATH, DEFAULT_DB_PATH):
+            st.error("Admin access is locked until VENDORFLOW_ADMIN_PASSWORD is set in Streamlit secrets.")
             return
         expected = expected or "demo-admin"
         if submit:
@@ -481,14 +482,19 @@ def about_page() -> None:
     st.write("Optional OpenAI-assisted extraction is disabled by default. When explicitly enabled and configured, the model may suggest fields, but a candidate is stored only if the exact text appears in its source PDF. Deterministic local extraction remains active. Follow-up messages are template-generated and never sent.")
 
 
-initialize_app()
+try:
+    initialize_app()
+except StorageError as exc:
+    st.error(f"VendorFlow could not initialize persistent storage. {exc}")
+    st.stop()
 with st.sidebar:
     st.markdown('<div class="brand"><span class="brand-mark">◈</span>VendorFlow AI</div>', unsafe_allow_html=True)
     st.caption("Intelligent vendor onboarding")
-    st.markdown('<span class="demo-label">LOCAL DEMO</span>', unsafe_allow_html=True)
+    st.markdown('<span class="demo-label">DEMO VERIFICATION</span>', unsafe_allow_html=True)
     selection = st.radio("Workspace", ["Vendor Portal", "Track / Correct", "Procurement Admin", "Demo Scenarios", "How it works"], label_visibility="collapsed")
     st.markdown("---")
-    st.caption("SQLite · local PDF extraction · explainable policy")
+    active_storage = "Supabase Postgres · private PDF storage" if uses_supabase_database(DEFAULT_DB_PATH, DEFAULT_DB_PATH) else "SQLite · local PDF uploads"
+    st.caption(f"{active_storage} · explainable policy")
     st.caption(ai_capability_label())
 
 if selection == "Vendor Portal":

@@ -3,28 +3,29 @@
 from __future__ import annotations
 
 import json
-import os
 import urllib.error
 import urllib.request
 from typing import Any
 
+from .storage import get_setting
+
 
 def ai_capability_label() -> str:
-    if os.getenv("VENDORFLOW_ENABLE_AI", "false").strip().lower() not in {"1", "true", "yes"}:
+    if str(get_setting("VENDORFLOW_ENABLE_AI", "false")).strip().lower() not in {"1", "true", "yes"}:
         return "AI extraction disabled; local PDF text rules are active."
-    if not os.getenv("OPENAI_API_KEY"):
+    if not get_setting("OPENAI_API_KEY"):
         return "AI extraction unavailable; OPENAI_API_KEY is not configured."
-    return f"AI extraction enabled ({os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}); source matching is enforced."
+    return f"AI extraction enabled ({get_setting('OPENAI_MODEL', 'gpt-4o-mini')}); source matching is enforced."
 
 
 def extract_with_ai(text: str) -> tuple[dict[str, Any], str]:
     """Request JSON candidates and accept source-matched candidates only."""
-    if os.getenv("VENDORFLOW_ENABLE_AI", "false").strip().lower() not in {"1", "true", "yes"}:
+    if str(get_setting("VENDORFLOW_ENABLE_AI", "false")).strip().lower() not in {"1", "true", "yes"}:
         return {}, "disabled"
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = get_setting("OPENAI_API_KEY")
     if not api_key:
         return {}, "unavailable: API key missing"
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = str(get_setting("OPENAI_MODEL", "gpt-4o-mini"))
     body = {
         "model": model,
         "temperature": 0,

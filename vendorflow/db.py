@@ -9,6 +9,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .documents import MAX_UPLOAD_BYTES
+from .storage import StorageError, initialize_supabase_storage, supabase_config, uses_supabase_database
+
 
 DEFAULT_DB_PATH = Path(os.getenv("VENDORFLOW_DB_PATH", "data/vendorflow.db"))
 
@@ -141,8 +144,76 @@ CREATE TABLE IF NOT EXISTS submission_requests (
 CREATE INDEX IF NOT EXISTS idx_submission_requests_recent ON submission_requests(request_signature, created_at);
 """
 
+POSTGRES_RLS_TABLES = (
+    "vendors",
+    "applications",
+    "application_revisions",
+    "uploaded_documents",
+    "verification_runs",
+    "verification_checks",
+    "extracted_fields",
+    "decisions",
+    "reviewer_actions",
+    "communications",
+    "audit_events",
+    "submission_requests",
+)
 
-def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+
+class _PostgresConnection:
+    """Small adapter for the SQLite-like execute API used by the workflow."""
+
+    def __init__(self, connection: Any):
+        self._connection = connection
+
+    @staticmethod
+    def _translate(sql: str) -> str:
+        return sql.replace("%", "%%").replace("?", "%s")
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        if sql.strip().rstrip(";").upper() == "BEGIN IMMEDIATE":
+            # Serialize short form submissions. This mirrors SQLite's immediate
+            # write transaction and rechecks the duplicate signature after lock.
+            return self._connection.execute("SELECT pg_advisory_xact_lock(hashtext('vendorflow-submit'))")
+        return self._connection.execute(self._translate(sql), params)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if not statement or statement.upper().startswith("PRAGMA "):
+                continue
+            self.execute(statement)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def connect(db_path: str | Path | None = None) -> Any:
+    if uses_supabase_database(db_path, DEFAULT_DB_PATH):
+        config = supabase_config()
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise StorageError("Supabase mode requires psycopg. Install the pinned project requirements.") from exc
+        try:
+            connection = psycopg.connect(
+                config["db_url"],
+                row_factory=dict_row,
+                connect_timeout=10,
+                sslmode="require",
+            )
+        except Exception as exc:
+            # Do not include the DSN or driver message: it can contain credentials.
+            raise StorageError("Could not connect to Supabase Postgres. Check its URL, password, and project status.") from None
+        return _PostgresConnection(connection)
+
     path = Path(db_path) if db_path else DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=20)
@@ -153,16 +224,27 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
 
 
 def initialize_database(db_path: str | Path | None = None) -> None:
+    remote = uses_supabase_database(db_path, DEFAULT_DB_PATH)
     conn = connect(db_path)
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
+        if not remote:
+            conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        if remote:
+            # The app connects server-side as the database owner. No Data API
+            # policies are created, so public/anon roles cannot read these rows.
+            for table in POSTGRES_RLS_TABLES:
+                conn.execute(f'ALTER TABLE "{table}" ENABLE ROW LEVEL SECURITY')
+                conn.execute(f'REVOKE ALL ON TABLE "{table}" FROM PUBLIC, anon, authenticated')
+        conn.commit()
     finally:
         conn.close()
+    if remote:
+        initialize_supabase_storage(MAX_UPLOAD_BYTES)
 
 
 @contextmanager
-def database(db_path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
+def database(db_path: str | Path | None = None) -> Iterator[Any]:
     conn = connect(db_path)
     try:
         yield conn
@@ -187,11 +269,11 @@ def json_load(value: str | None, fallback: Any = None) -> Any:
         return {} if fallback is None else fallback
 
 
-def query_one(sql: str, params: tuple[Any, ...] = (), db_path: str | Path | None = None) -> sqlite3.Row | None:
+def query_one(sql: str, params: tuple[Any, ...] = (), db_path: str | Path | None = None) -> Any | None:
     with database(db_path) as conn:
         return conn.execute(sql, params).fetchone()
 
 
-def query_all(sql: str, params: tuple[Any, ...] = (), db_path: str | Path | None = None) -> list[sqlite3.Row]:
+def query_all(sql: str, params: tuple[Any, ...] = (), db_path: str | Path | None = None) -> list[Any]:
     with database(db_path) as conn:
         return conn.execute(sql, params).fetchall()
