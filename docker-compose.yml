@@ -1,0 +1,12 @@
+services:
+  vendorflow:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      VENDORFLOW_DB_PATH: /app/data/vendorflow.db
+      VENDORFLOW_DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data

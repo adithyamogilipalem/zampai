@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.pytest-tmp/
+.streamlit_smoke.py
+*.py[cod]
+data/
+*.db
+*.db-shm
+*.db-wal

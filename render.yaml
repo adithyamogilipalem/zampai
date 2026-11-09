@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: vendorflow-ai
+    runtime: docker
+    plan: 0.5c-512mb
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    autoDeployTrigger: commit
+    healthCheckPath: /
+    disk:
+      name: vendorflow-data
+      mountPath: /var/lib/vendorflow
+      sizeGB: 1
+    envVars:
+      - key: VENDORFLOW_DATA_DIR
+        value: /var/lib/vendorflow
+      - key: VENDORFLOW_DB_PATH
+        value: /var/lib/vendorflow/vendorflow.db
+      - key: VENDORFLOW_MAX_UPLOAD_MB
+        value: "10"
+      - key: VENDORFLOW_ADMIN_PASSWORD
+        sync: false
+      - key: VENDORFLOW_ENABLE_AI
+        value: "false"
